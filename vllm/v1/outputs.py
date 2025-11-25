@@ -181,6 +181,11 @@ class ModelRunnerOutput:
     # req_id -> num_nans_in_logits
     num_nans_in_logits: dict[str, int] | None = None
 
+    # Activation monitor scores per request
+    # List of [num_tokens_for_req, num_classes] numpy arrays, one per request
+    # None if activation monitors are not enabled
+    activation_monitor_output: list[np.ndarray] | None = None
+
 
 # ModelRunnerOutput wrapper for async scheduling.
 class AsyncModelRunnerOutput(ABC):
@@ -235,6 +240,7 @@ def make_empty_encoder_model_runner_output(
         kv_connector_output=None,
         ec_connector_output=None,
         num_nans_in_logits=None,
+        activation_monitor_output=None,
     )
 
 
@@ -246,4 +252,5 @@ EMPTY_MODEL_RUNNER_OUTPUT = ModelRunnerOutput(
     prompt_logprobs_dict={},
     pooler_output=[],
     num_nans_in_logits=None,
+    activation_monitor_output=None,
 )

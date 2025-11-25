@@ -34,6 +34,7 @@ from typing_extensions import TypeIs
 import vllm.envs as envs
 from vllm.attention.backends.registry import AttentionBackendEnum
 from vllm.config import (
+    ActivationMonitorConfig,
     CacheConfig,
     CompilationConfig,
     ConfigType,
@@ -528,6 +529,8 @@ class EngineArgs:
     kv_events_config: KVEventsConfig | None = None
 
     ec_transfer_config: ECTransferConfig | None = None
+
+    activation_monitor_config: ActivationMonitorConfig | None = None
 
     generation_config: str = ModelConfig.generation_config
     enable_sleep_mode: bool = ModelConfig.enable_sleep_mode
@@ -1749,6 +1752,7 @@ class EngineArgs:
             kv_transfer_config=self.kv_transfer_config,
             kv_events_config=self.kv_events_config,
             ec_transfer_config=self.ec_transfer_config,
+            activation_monitor_config=self.activation_monitor_config,
             additional_config=self.additional_config,
         )
 

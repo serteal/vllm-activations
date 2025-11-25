@@ -26,6 +26,7 @@ from vllm.logger import enable_trace_function_call, init_logger
 from vllm.transformers_utils.runai_utils import is_runai_obj_uri
 from vllm.utils import random_uuid
 
+from .activation_monitor import ActivationMonitorConfig
 from .cache import CacheConfig
 from .compilation import CompilationConfig, CompilationMode, CUDAGraphMode
 from .device import DeviceConfig
@@ -107,6 +108,10 @@ class VllmConfig:
     """The configurations for event publishing."""
     ec_transfer_config: ECTransferConfig | None = None
     """The configurations for distributed EC cache transfer."""
+    activation_monitor_config: ActivationMonitorConfig | None = None
+    """Configuration for activation monitors (probes) attached to LLM layers.
+    Activation monitors are lightweight classification heads that produce
+    auxiliary scores alongside normal token generation."""
     # some opaque config, only used to provide additional information
     # for the hash computation, mainly used for testing, debugging or out of
     # tree config registration.
@@ -189,6 +194,10 @@ class VllmConfig:
             vllm_factors.append("None")
         if self.ec_transfer_config:
             vllm_factors.append(self.ec_transfer_config.compute_hash())
+        else:
+            vllm_factors.append("None")
+        if self.activation_monitor_config:
+            vllm_factors.append(self.activation_monitor_config.compute_hash())
         else:
             vllm_factors.append("None")
         if self.additional_config:

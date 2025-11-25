@@ -204,6 +204,7 @@ class RequestState:
         finish_reason: FinishReason | None,
         stop_reason: int | str | None,
         kv_transfer_params: dict[str, Any] | None = None,
+        activation_monitor_scores: list[list[float]] | None = None,
     ) -> RequestOutput | PoolingRequestOutput | None:
         finished = finish_reason is not None
         final_only = self.output_kind == RequestOutputKind.FINAL_ONLY
@@ -241,7 +242,9 @@ class RequestState:
                 request_id, [self._new_pooling_output(pooling_output)], finished
             )
 
-        output = self._new_completion_output(new_token_ids, finish_reason, stop_reason)
+        output = self._new_completion_output(
+            new_token_ids, finish_reason, stop_reason, activation_monitor_scores
+        )
 
         if self.parent_req is None:
             outputs = [output]
@@ -304,6 +307,7 @@ class RequestState:
         token_ids: list[int],
         finish_reason: FinishReason | None,
         stop_reason: int | str | None,
+        activation_monitor_scores: list[list[float]] | None = None,
     ) -> CompletionOutput:
         assert self.detokenizer is not None
         assert self.logprobs_processor is not None
@@ -320,6 +324,16 @@ class RequestState:
         if delta and logprobs:
             logprobs = logprobs[-len(token_ids) :]
 
+        # Convert activation monitor scores to dict format
+        monitor_scores: list[dict[int, float]] | None = None
+        if activation_monitor_scores is not None:
+            # Convert list[list[float]] to list[dict[int, float]]
+            # Each inner list is [score_class_0, score_class_1, ...]
+            monitor_scores = [
+                {cls_idx: score for cls_idx, score in enumerate(token_scores)}
+                for token_scores in activation_monitor_scores
+            ]
+
         return CompletionOutput(
             index=self.request_index,
             text=text,
@@ -328,6 +342,7 @@ class RequestState:
             cumulative_logprob=self.logprobs_processor.cumulative_logprob,
             finish_reason=str(finish_reason) if finished else None,
             stop_reason=stop_reason if finished else None,
+            monitor_scores=monitor_scores,
         )
 
     def _new_pooling_output(
@@ -500,6 +515,9 @@ class OutputProcessor:
                 # if required.
                 req_state.logprobs_processor.update_from_output(engine_core_output)
 
+            # Extract activation monitor scores.
+            activation_monitor_scores = engine_core_output.activation_monitor_scores
+
             # 4) Create and handle RequestOutput objects.
             if request_output := req_state.make_request_output(
                 new_token_ids,
@@ -507,6 +525,7 @@ class OutputProcessor:
                 finish_reason,
                 stop_reason,
                 kv_transfer_params,
+                activation_monitor_scores,
             ):
                 if req_state.queue is not None:
                     # AsyncLLM: put into queue for handling by generate().

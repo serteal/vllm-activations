@@ -30,11 +30,13 @@ from .interfaces_base import VllmModel, is_pooling_model
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.model_executor.layers.activation_monitor import ActivationMonitor
     from vllm.model_executor.models.utils import WeightsMapper
     from vllm.multimodal.inputs import MultiModalFeatureSpec
     from vllm.sequence import IntermediateTensors
 else:
     VllmConfig = object
+    ActivationMonitor = object
     WeightsMapper = object
     MultiModalFeatureSpec = object
     IntermediateTensors = object
@@ -1038,6 +1040,63 @@ def supports_eagle3(
     model: type[object] | object,
 ) -> TypeIs[type[SupportsEagle3]] | TypeIs[SupportsEagle3]:
     return isinstance(model, SupportsEagle3)
+
+
+@runtime_checkable
+class SupportsActivationMonitor(Protocol):
+    """The interface required for models that support activation monitors.
+
+    Activation monitors are lightweight classification heads (probes) that
+    can be attached to intermediate layers of an LLM to produce auxiliary
+    scores alongside normal token generation. They reuse the auxiliary
+    hidden state mechanism from Eagle3.
+    """
+
+    supports_activation_monitor: ClassVar[Literal[True]] = True
+    """
+    A flag that indicates this model supports activation monitors.
+
+    Note:
+        There is no need to redefine this flag if this class is in the
+        MRO of your model class.
+    """
+
+    def set_activation_monitor_layers(self, layers: tuple[int, ...]) -> None:
+        """Configure which layers output hidden states for monitoring.
+
+        This typically delegates to set_aux_hidden_state_layers() since
+        activation monitors reuse the Eagle3 auxiliary hidden state mechanism.
+
+        Args:
+            layers: Tuple of layer indices to capture hidden states from.
+        """
+        ...
+
+    def get_activation_monitor(self) -> "ActivationMonitor | None":
+        """Get the activation monitor instance, if configured.
+
+        Returns:
+            The ActivationMonitor module, or None if not configured.
+        """
+        ...
+
+
+@overload
+def supports_activation_monitor(
+    model: type[object],
+) -> TypeIs[type[SupportsActivationMonitor]]: ...
+
+
+@overload
+def supports_activation_monitor(
+    model: object,
+) -> TypeIs[SupportsActivationMonitor]: ...
+
+
+def supports_activation_monitor(
+    model: type[object] | object,
+) -> TypeIs[type[SupportsActivationMonitor]] | TypeIs[SupportsActivationMonitor]:
+    return isinstance(model, SupportsActivationMonitor)
 
 
 @runtime_checkable

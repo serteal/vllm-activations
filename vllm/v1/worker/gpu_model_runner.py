@@ -49,6 +49,7 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
+from vllm.model_executor.layers.activation_monitor import load_activation_monitor
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.rotary_embedding import (
     MRotaryEmbedding,
@@ -60,6 +61,7 @@ from vllm.model_executor.models.interfaces import (
     SupportsMultiModal,
     SupportsXDRoPE,
     is_mixture_of_experts,
+    supports_activation_monitor,
     supports_eagle3,
     supports_mrope,
     supports_multimodal_pruning,
@@ -366,6 +368,9 @@ class GPUModelRunner(
         self.encoder_cache: dict[str, torch.Tensor] = {}
 
         self.use_aux_hidden_state_outputs = False
+        self.use_activation_monitors = (
+            vllm_config.activation_monitor_config is not None
+        )
         # Set up speculative decoding.
         # NOTE(Jiayi): currently we put the entire draft model on
         # the last PP rank. This is not ideal if there are many
@@ -3123,6 +3128,19 @@ class GPUModelRunner(
 
         with record_function_or_nullcontext("gpu_model_runner: eplb"):
             self.eplb_step()
+
+        # Execute activation monitors if enabled
+        activation_monitor_output: list[np.ndarray] | None = None
+        if self.use_activation_monitors and aux_hidden_states is not None:
+            with record_function_or_nullcontext(
+                "gpu_model_runner: activation_monitor"
+            ):
+                activation_monitor_output = self._execute_activation_monitors(
+                    aux_hidden_states,
+                    valid_sampled_token_ids,
+                    scheduler_output,
+                )
+
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             output = ModelRunnerOutput(
                 req_ids=req_ids_output_copy,
@@ -3136,6 +3154,7 @@ class GPUModelRunner(
                 if self.supports_mm_inputs
                 else None,
                 num_nans_in_logits=num_nans_in_logits,
+                activation_monitor_output=activation_monitor_output,
             )
 
         if not self.use_async_scheduling:
@@ -3454,6 +3473,11 @@ class GPUModelRunner(
                     aux_layers = self.model.get_eagle3_aux_hidden_state_layers()
 
                 self.model.set_aux_hidden_state_layers(aux_layers)
+
+            # Set up activation monitors
+            if self.use_activation_monitors:
+                self._setup_activation_monitors()
+
             time_after_load = time.perf_counter()
         self.model_memory_usage = m.consumed_memory
         logger.info_once(
@@ -3543,6 +3567,95 @@ class GPUModelRunner(
             return tuple(layer_ids)
 
         return None
+
+    def _setup_activation_monitors(self) -> None:
+        """Set up activation monitors for the model.
+
+        Loads activation monitor weights from HuggingFace or local path and
+        configures the model to capture hidden states at the specified layers.
+        """
+        assert self.vllm_config.activation_monitor_config is not None
+
+        model = self.get_model()
+        if not supports_activation_monitor(model):
+            raise RuntimeError(
+                f"Model {type(model).__name__} does not support activation "
+                "monitors. Ensure the model implements SupportsActivationMonitor."
+            )
+
+        config = self.vllm_config.activation_monitor_config
+
+        # Load the activation monitor
+        monitor = load_activation_monitor(
+            config=config,
+            model_hidden_size=self.model_config.get_hidden_size(),
+            num_layers=self.model_config.get_num_layers(self.parallel_config),
+            device=self.device,
+            dtype=self.model_config.dtype,
+        )
+
+        # Set the monitor on the model
+        model.activation_monitor = monitor
+
+        # Configure which layers to capture hidden states from
+        model.set_activation_monitor_layers(config.monitor_layers)
+
+        # Enable aux hidden state outputs (reuses Eagle3 mechanism)
+        self.use_aux_hidden_state_outputs = True
+
+        logger.info(
+            "Activation monitors enabled for layers %s with %d classes",
+            config.monitor_layers,
+            config.num_classes,
+        )
+
+    def _execute_activation_monitors(
+        self,
+        aux_hidden_states: list[torch.Tensor],
+        sampled_token_ids: list[list[int]],
+        scheduler_output: "SchedulerOutput",
+    ) -> list[np.ndarray]:
+        """Execute activation monitors on the auxiliary hidden states.
+
+        Args:
+            aux_hidden_states: List of hidden states from monitored layers.
+                Each tensor has shape [num_tokens, hidden_size].
+            sampled_token_ids: List of sampled token IDs per request.
+            scheduler_output: The scheduler output containing request info.
+
+        Returns:
+            List of numpy arrays with monitor scores per request.
+            Each array has shape [num_tokens_for_req, num_classes].
+        """
+        model = self.get_model()
+        monitor = model.get_activation_monitor()
+        if monitor is None:
+            return []
+
+        # Run the activation monitor on the concatenated hidden states
+        # aux_hidden_states is list of [num_tokens, hidden_size] tensors
+        # We need to get scores for each position
+        with torch.no_grad():
+            # Forward pass through monitor
+            # Shape: [num_tokens, num_classes]
+            scores = monitor(aux_hidden_states)
+
+        # Convert to numpy for efficient serialization
+        scores_np = scores.cpu().numpy()
+
+        # Split scores by request
+        result: list[np.ndarray] = []
+        start_idx = 0
+        for token_ids in sampled_token_ids:
+            num_tokens = len(token_ids)
+            if num_tokens > 0:
+                result.append(scores_np[start_idx : start_idx + num_tokens])
+                start_idx += num_tokens
+            else:
+                # Handle empty case
+                result.append(np.zeros((0, scores_np.shape[1]), dtype=np.float32))
+
+        return result
 
     def reload_weights(self) -> None:
         assert getattr(self, "model", None) is not None, (

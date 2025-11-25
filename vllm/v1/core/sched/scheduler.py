@@ -992,6 +992,7 @@ class Scheduler(SchedulerInterface):
         pooler_outputs = model_runner_output.pooler_output
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
+        activation_monitor_output = model_runner_output.activation_monitor_output
 
         outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
         spec_decoding_stats: SpecDecodingStats | None = None
@@ -1104,6 +1105,15 @@ class Scheduler(SchedulerInterface):
 
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
+
+            # Get activation monitor scores for this request.
+            monitor_scores: list[list[float]] | None = None
+            if activation_monitor_output is not None:
+                req_monitor_scores = activation_monitor_output[req_index]
+                if req_monitor_scores.size > 0:
+                    # Convert numpy array to list of lists for serialization
+                    monitor_scores = req_monitor_scores.tolist()
+
             if new_token_ids or pooler_output is not None or kv_transfer_params:
                 # Add EngineCoreOutput for this Request.
                 outputs[request.client_index].append(
@@ -1120,6 +1130,7 @@ class Scheduler(SchedulerInterface):
                         trace_headers=request.trace_headers,
                         num_cached_tokens=request.num_cached_tokens,
                         num_nans_in_logits=request.num_nans_in_logits,
+                        activation_monitor_scores=monitor_scores,
                     )
                 )
             else:

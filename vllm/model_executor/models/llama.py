@@ -56,7 +56,13 @@ from vllm.model_executor.model_loader.weight_utils import (
 )
 from vllm.sequence import IntermediateTensors
 
-from .interfaces import SupportsEagle, SupportsEagle3, SupportsLoRA, SupportsPP
+from .interfaces import (
+    SupportsActivationMonitor,
+    SupportsEagle,
+    SupportsEagle3,
+    SupportsLoRA,
+    SupportsPP,
+)
 from .utils import (
     AutoWeightsLoader,
     PPMissingLayer,
@@ -515,7 +521,12 @@ class LlamaModel(nn.Module):
 
 
 class LlamaForCausalLM(
-    nn.Module, SupportsLoRA, SupportsPP, SupportsEagle, SupportsEagle3
+    nn.Module,
+    SupportsLoRA,
+    SupportsPP,
+    SupportsEagle,
+    SupportsEagle3,
+    SupportsActivationMonitor,
 ):
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
@@ -528,6 +539,9 @@ class LlamaForCausalLM(
         "lm_head": "output_embeddings",
     }
     embedding_padding_modules = ["lm_head"]
+
+    # Activation monitor support
+    supports_activation_monitor = True
 
     # Mistral/Llama models can also be loaded with --load-format mistral
     # from consolidated.safetensors checkpoints
@@ -594,6 +608,9 @@ class LlamaForCausalLM(
             self.model.make_empty_intermediate_tensors
         )
 
+        # Activation monitor - will be set by model runner if configured
+        self.activation_monitor: nn.Module | None = None
+
     def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
         self.model.aux_hidden_state_layers = layers
 
@@ -605,6 +622,19 @@ class LlamaForCausalLM(
         """
         num_layers = len(self.model.layers)
         return (2, num_layers // 2, num_layers - 3)
+
+    # SupportsActivationMonitor interface methods
+    def set_activation_monitor_layers(self, layers: tuple[int, ...]) -> None:
+        """Configure which layers output hidden states for monitoring.
+
+        This delegates to set_aux_hidden_state_layers since activation monitors
+        reuse the Eagle3 auxiliary hidden state mechanism.
+        """
+        self.set_aux_hidden_state_layers(layers)
+
+    def get_activation_monitor(self):
+        """Get the activation monitor instance, if configured."""
+        return self.activation_monitor
 
     def _init_model(
         self,
