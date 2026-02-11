@@ -391,6 +391,23 @@ class LlamaModel(nn.Module):
 
         self.aux_hidden_state_layers = tuple[int, ...]()
 
+        # Activation capture for probing (separate from EAGLE 3 aux states).
+        # Captures hidden_states + residual AFTER each specified layer.
+        # Read from env var so layers are set BEFORE torch.compile traces
+        # the forward method (Dynamo eliminates branches with empty tuples).
+        import os
+        _env_layers = os.environ.get("_VLLM_ACTIVATION_CAPTURE_LAYERS", "")
+        self.activation_capture_layers: tuple[int, ...] = (
+            tuple(int(x) for x in _env_layers.split(",")) if _env_layers else ()
+        )
+        self._captured_activations: dict[int, list[torch.Tensor]] = {}
+        # Early exit: skip layers after the last capture layer.
+        # Output hidden states will be incorrect but we only need activations.
+        self._early_exit_layer: int = (
+            max(self.activation_capture_layers)
+            if self.activation_capture_layers else -1
+        )
+
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
         )
@@ -421,11 +438,19 @@ class LlamaModel(nn.Module):
         for idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer)
         ):
-            if idx in self.aux_hidden_state_layers:
+            # Convert local PP-stage layer index to global model layer index.
+            global_idx = self.start_layer + idx
+            if global_idx in self.aux_hidden_state_layers:
                 aux_hidden_states.append(hidden_states + residual)
             hidden_states, residual = layer(
                 positions, hidden_states, residual, **extra_layer_kwargs
             )
+            if global_idx in self.activation_capture_layers:
+                self._captured_activations.setdefault(global_idx, []).append(
+                    (hidden_states + residual).detach()
+                )
+                if global_idx == self._early_exit_layer:
+                    break
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
@@ -558,6 +583,30 @@ class LlamaForCausalLM(
 
     def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
         self.model.aux_hidden_state_layers = layers
+
+    def set_activation_capture_layers(self, layers: tuple[int, ...]) -> None:
+        """Configure which layers to capture activations from (post-layer)."""
+        self.model.activation_capture_layers = tuple(layers)
+        self.model._captured_activations = {}
+        self.model._early_exit_layer = max(layers) if layers else -1
+
+    def get_captured_activations(self) -> dict[int, torch.Tensor]:
+        """Retrieve and clear accumulated activations.
+
+        Returns dict mapping layer_idx to tensor [total_tokens, hidden_dim].
+        Multiple forward passes are concatenated along the token dimension.
+        """
+        raw = self.pop_captured_activations()
+        result: dict[int, torch.Tensor] = {}
+        for layer_idx, tensors in raw.items():
+            result[layer_idx] = torch.cat(tensors, dim=0)
+        return result
+
+    def pop_captured_activations(self) -> dict[int, list[torch.Tensor]]:
+        """Retrieve and clear captured activations without concatenation."""
+        result = self.model._captured_activations
+        self.model._captured_activations = {}
+        return result
 
     def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
         """Override to return default layers for Llama

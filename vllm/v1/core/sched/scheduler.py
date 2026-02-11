@@ -1340,7 +1340,21 @@ class Scheduler(SchedulerInterface):
             status_before_stop = request.status
 
             # Check for stop and update request status.
-            if new_token_ids:
+            prefill_only = False
+            if request.sampling_params is not None:
+                extra_args = request.sampling_params.extra_args
+                if isinstance(extra_args, dict):
+                    prefill_only = bool(
+                        extra_args.get("_activation_prefill_only", False)
+                    )
+
+            if prefill_only:
+                # Activation-only prefill mode: finish requests immediately after
+                # prompt processing and drop sampled decode tokens.
+                new_token_ids = []
+                request.status = RequestStatus.FINISHED_LENGTH_CAPPED
+                stopped = True
+            elif new_token_ids:
                 new_token_ids, stopped = self._update_request_with_output(
                     request, new_token_ids
                 )

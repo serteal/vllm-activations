@@ -6,7 +6,7 @@ import gc
 import itertools
 import threading
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from collections.abc import Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from copy import copy, deepcopy
@@ -315,7 +315,7 @@ class ExecuteModelState(NamedTuple):
     sample_tokens(), after execute_model() returns None."""
 
     scheduler_output: "SchedulerOutput"
-    logits: torch.Tensor
+    logits: torch.Tensor | None
     spec_decode_metadata: SpecDecodeMetadata | None
     spec_decode_common_attn_metadata: CommonAttentionMetadata | None
     hidden_states: torch.Tensor
@@ -953,6 +953,7 @@ class GPUModelRunner(
 
             req_state = CachedRequestState(
                 req_id=req_id,
+                external_req_id=new_req_data.external_req_id,
                 prompt_token_ids=new_req_data.prompt_token_ids,
                 prompt_embeds=new_req_data.prompt_embeds,
                 mm_features=new_req_data.mm_features,
@@ -2563,6 +2564,595 @@ class GPUModelRunner(
             return self.model.unwrap()
         return self.model
 
+    # ── Activation capture for probing ────────────────────────────────
+
+    _activation_capture_active: bool = False
+    _activation_capture_pool: str | None = None
+    _activation_capture_fast_path: bool = False
+    _activation_capture_tp_rank0_only: bool = True
+    _activation_capture_flat_output: bool = True
+    _activation_store: dict
+    _activation_step_store: list[dict[str, Any]]
+    _activation_stats: defaultdict[str, float]
+    _activation_export_value_buffers: list[dict[int, torch.Tensor]]
+    _activation_export_offset_buffers: list[dict[int, torch.Tensor]]
+    _activation_export_slot: int
+    _activation_staged_exports: deque[
+        tuple[dict[str, Any], torch.cuda.Event | None, list[torch.Tensor] | None]
+    ]
+
+    def register_activation_capture(
+        self,
+        layers: list[int],
+        hook_point: str = "post_block",
+        pool_mode: str | None = None,
+        activation_only: bool = False,
+        tp_rank0_only: bool = True,
+        flat_output: bool = True,
+    ) -> None:
+        """Configure model to capture activations at specified layers."""
+        if hook_point != "post_block":
+            raise ValueError(
+                f"Unsupported hook_point={hook_point!r}. "
+                "Only 'post_block' is currently supported."
+            )
+        if pool_mode not in (None, "mean", "last_token"):
+            raise ValueError(
+                f"Unsupported pool_mode={pool_mode!r}. "
+                "Expected one of: None, 'mean', 'last_token'."
+            )
+        model = self.get_model()
+        model.set_activation_capture_layers(tuple(layers))
+        self._activation_capture_active = True
+        self._activation_capture_pool = pool_mode
+        if activation_only and self.use_async_scheduling:
+            logger.warning(
+                "activation_only fast path is not supported with async scheduling; "
+                "falling back to standard sampling path."
+            )
+            activation_only = False
+        self._activation_capture_fast_path = activation_only
+        self._activation_capture_tp_rank0_only = tp_rank0_only
+        self._activation_capture_flat_output = flat_output
+        self._activation_store = {}
+        self._activation_step_store = []
+        self._activation_stats = defaultdict(float)
+        self._activation_export_value_buffers = [{}, {}]
+        self._activation_export_offset_buffers = [{}, {}]
+        self._activation_export_slot = 0
+        self._activation_staged_exports = deque()
+
+    def _to_external_req_id(self, internal_req_id: str) -> str:
+        req_state = self.requests.get(internal_req_id)
+        if req_state is not None and req_state.external_req_id is not None:
+            return req_state.external_req_id
+        return internal_req_id
+
+    def _process_step_activations(
+        self, req_ids: list[str], num_tokens_per_req: list[int]
+    ) -> None:
+        """Split this step's captured activations by request and store."""
+        model = self.get_model()
+        # Prefer uncatted activations to avoid an extra cat per layer.
+        if hasattr(model, "pop_captured_activations"):
+            step_acts = model.pop_captured_activations()
+        else:
+            legacy = model.get_captured_activations()
+            step_acts = {layer_idx: [t] for layer_idx, t in legacy.items()}
+        if not step_acts:
+            return
+        if self._activation_capture_tp_rank0_only and not is_global_first_rank():
+            return
+        t0 = time.perf_counter()
+        pool_mode = self._activation_capture_pool
+        total_req_tokens = int(sum(num_tokens_per_req))
+
+        # Fast path for common activation collection workload:
+        # a single prefill step with flat output and no pooling.
+        # Keep per-layer tensors in flat form and defer request-level slicing.
+        if (
+            pool_mode is None
+            and self._activation_capture_flat_output
+            and not self._activation_store
+            and not self._activation_step_store
+        ):
+            single_chunk_only = True
+            for tensor_chunks in step_acts.values():
+                if isinstance(tensor_chunks, torch.Tensor):
+                    continue
+                if len(tensor_chunks) != 1:
+                    single_chunk_only = False
+                    break
+            if not single_chunk_only:
+                self._activation_stats["deferred_fastpath_skipped"] += 1.0
+            else:
+                ext_req_ids = [self._to_external_req_id(req_id) for req_id in req_ids]
+                lengths = [int(n) for n in num_tokens_per_req]
+                step_layers: dict[int, torch.Tensor] = {}
+                for layer_idx, tensor_chunks in step_acts.items():
+                    if isinstance(tensor_chunks, torch.Tensor):
+                        flat_t = tensor_chunks
+                    else:
+                        flat_t = tensor_chunks[0]
+                    # In prefill graphs, captured activations can include trailing
+                    # pad rows. Trim here to avoid copying/splitting unused tokens.
+                    if flat_t.shape[0] > total_req_tokens:
+                        flat_t = flat_t[:total_req_tokens]
+                    step_layers[layer_idx] = flat_t
+                self._activation_step_store.append(
+                    {
+                        "req_ids": ext_req_ids,
+                        "lengths": lengths,
+                        "layers": step_layers,
+                    }
+                )
+                self._activation_stats["split_store_s"] += time.perf_counter() - t0
+                self._activation_stats["steps"] += 1.0
+                return
+
+        if self._activation_step_store:
+            self._materialize_activation_step_store()
+
+        for layer_idx, tensor_chunks in step_acts.items():
+            chunks: list[torch.Tensor]
+            if isinstance(tensor_chunks, torch.Tensor):
+                chunks = [tensor_chunks]
+            else:
+                chunks = list(tensor_chunks)
+
+            for flat_tensor in chunks:
+                if flat_tensor.shape[0] > total_req_tokens:
+                    flat_tensor = flat_tensor[:total_req_tokens]
+                offset = 0
+                for req_id, n in zip(req_ids, num_tokens_per_req):
+                    ext_id = self._to_external_req_id(req_id)
+                    layer_store = self._activation_store.setdefault(ext_id, {})
+                    req_tensor = flat_tensor[offset : offset + n]
+                    if n == 0:
+                        continue
+
+                    if pool_mode is None:
+                        layer_store.setdefault(layer_idx, []).append(req_tensor)
+                    elif pool_mode == "mean":
+                        req_sum = req_tensor.sum(dim=0)
+                        if layer_idx in layer_store:
+                            prev_sum, prev_count = layer_store[layer_idx]
+                            layer_store[layer_idx] = (prev_sum + req_sum, prev_count + n)
+                        else:
+                            layer_store[layer_idx] = (req_sum, n)
+                    else:  # "last_token"
+                        layer_store[layer_idx] = req_tensor[-1]
+
+                    offset += n
+
+                if offset != flat_tensor.shape[0]:
+                    # Keep a lightweight counter instead of logging repeatedly in
+                    # hot path. This can happen with uncommon shape mismatches.
+                    self._activation_stats["split_mismatch"] += 1.0
+
+        self._activation_stats["split_store_s"] += time.perf_counter() - t0
+        self._activation_stats["steps"] += 1.0
+
+    def _materialize_activation_step_store(self) -> None:
+        """Convert deferred step stores into the per-request store format."""
+        if not self._activation_step_store:
+            return
+        for step in self._activation_step_store:
+            req_ids = cast(list[str], step["req_ids"])
+            lengths = cast(list[int], step["lengths"])
+            layers = cast(dict[int, torch.Tensor], step["layers"])
+            offsets = np.zeros(len(lengths) + 1, dtype=np.int64)
+            if lengths:
+                offsets[1:] = np.cumsum(np.asarray(lengths, dtype=np.int64))
+            for layer_idx, flat_tensor in layers.items():
+                for i, req_id in enumerate(req_ids):
+                    start = int(offsets[i])
+                    end = int(offsets[i + 1])
+                    if start == end:
+                        continue
+                    layer_store = self._activation_store.setdefault(req_id, {})
+                    layer_store.setdefault(layer_idx, []).append(flat_tensor[start:end])
+        self._activation_step_store = []
+
+    def _next_activation_export_slot(self) -> int:
+        slot = self._activation_export_slot
+        self._activation_export_slot = (slot + 1) % len(self._activation_export_value_buffers)
+        return slot
+
+    def _get_pinned_value_view(
+        self,
+        slot: int,
+        layer_idx: int,
+        shape: torch.Size,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        rows = int(shape[0]) if len(shape) > 0 else 0
+        hidden = int(shape[1]) if len(shape) > 1 else self.model_config.get_hidden_size()
+        buffers = self._activation_export_value_buffers[slot]
+        buf = buffers.get(layer_idx)
+        if (
+            buf is None
+            or buf.dtype != dtype
+            or buf.ndim != 2
+            or int(buf.shape[1]) != hidden
+            or int(buf.shape[0]) < rows
+        ):
+            prev_rows = int(buf.shape[0]) if buf is not None else 0
+            cap_rows = max(rows, prev_rows * 2, 1)
+            buf = torch.empty(
+                (cap_rows, hidden),
+                dtype=dtype,
+                device="cpu",
+                pin_memory=self.pin_memory,
+            )
+            buffers[layer_idx] = buf
+        return buf[:rows]
+
+    def _get_offset_view(self, slot: int, layer_idx: int, size: int) -> torch.Tensor:
+        buffers = self._activation_export_offset_buffers[slot]
+        buf = buffers.get(layer_idx)
+        if buf is None or buf.dtype != torch.int32 or buf.ndim != 1 or int(buf.shape[0]) < size:
+            prev = int(buf.shape[0]) if buf is not None else 0
+            cap = max(size, prev * 2, 1)
+            buf = torch.empty(cap, dtype=torch.int32, device="cpu")
+            buffers[layer_idx] = buf
+        return buf[:size]
+
+    def _build_captured_activations_flat(
+        self,
+        *,
+        sync: bool,
+    ) -> tuple[dict[str, Any], torch.cuda.Event | None, list[torch.Tensor] | None]:
+        """Build flat activation payload and optionally synchronize D2H copies."""
+        if self._activation_step_store and self._activation_store:
+            self._materialize_activation_step_store()
+
+        pool_mode = self._activation_capture_pool
+        concat_s = 0.0
+        copy_t0 = time.perf_counter()
+        copy_event: torch.cuda.Event | None = None
+        slot = self._next_activation_export_slot()
+
+        # Fast single-step path: directly export captured flat tensors.
+        if (
+            pool_mode is None
+            and not self._activation_store
+            and len(self._activation_step_store) == 1
+        ):
+            step = self._activation_step_store[0]
+            req_ids = cast(list[str], step["req_ids"])
+            lengths = cast(list[int], step["lengths"])
+            layers = cast(dict[int, torch.Tensor], step["layers"])
+
+            offsets_np = np.zeros(len(req_ids) + 1, dtype=np.int32)
+            if lengths:
+                offsets_np[1:] = np.cumsum(np.asarray(lengths, dtype=np.int32))
+            offsets_src = torch.from_numpy(offsets_np)
+            layers_payload: dict[int, dict[str, torch.Tensor]] = {}
+            source_refs: list[torch.Tensor] = []
+            copied = False
+            if sync:
+                # Synchronous export path: materialize stable CPU tensors directly.
+                for layer_idx, flat_t in layers.items():
+                    values = flat_t.cpu() if flat_t.is_cuda else flat_t
+                    offsets = offsets_src.clone()
+                    layers_payload[layer_idx] = {"values": values, "offsets": offsets}
+            else:
+                with torch.cuda.stream(self.comm_stream):
+                    self.comm_stream.wait_stream(torch.cuda.current_stream())
+                    for layer_idx, flat_t in layers.items():
+                        if flat_t.is_cuda:
+                            values = torch.empty(
+                                flat_t.shape,
+                                dtype=flat_t.dtype,
+                                device="cpu",
+                                pin_memory=self.pin_memory,
+                            )
+                            values.copy_(flat_t, non_blocking=True)
+                            copied = True
+                            source_refs.append(flat_t)
+                        else:
+                            values = flat_t
+                        offsets = offsets_src.clone()
+                        layers_payload[layer_idx] = {"values": values, "offsets": offsets}
+
+                    if copied:
+                        copy_event = torch.cuda.Event()
+                        self.comm_stream.record_event(copy_event)
+
+                if copy_event is not None:
+                    copy_event.synchronize()
+
+            self._activation_stats["cpu_copy_s"] += time.perf_counter() - copy_t0
+            self._activation_stats["concat_s"] += concat_s
+            self._activation_step_store = []
+            payload = {"__flat__": True, "req_ids": req_ids, "layers": layers_payload}
+            if sync:
+                source_refs = []
+                copy_event = None
+            return payload, copy_event, source_refs
+
+        if self._activation_step_store:
+            self._materialize_activation_step_store()
+
+        req_ids = list(self._activation_store.keys())
+        layer_ids = sorted(
+            {
+                layer_idx
+                for req_layers in self._activation_store.values()
+                for layer_idx in req_layers.keys()
+            }
+        )
+        layers_payload: dict[int, dict[str, torch.Tensor]] = {}
+        copied = False
+        source_refs: list[torch.Tensor] = []
+        if sync:
+            for layer_idx in layer_ids:
+                req_tensors: list[torch.Tensor] = []
+                lengths: list[int] = []
+                for req_id in req_ids:
+                    payload = self._activation_store[req_id].get(layer_idx)
+                    if payload is None:
+                        lengths.append(0)
+                        continue
+
+                    if pool_mode is None:
+                        cat_t0 = time.perf_counter()
+                        tensor_list = cast(list[torch.Tensor], payload)
+                        req_t = (
+                            torch.cat(tensor_list, dim=0)
+                            if len(tensor_list) > 1
+                            else tensor_list[0]
+                        )
+                        concat_s += time.perf_counter() - cat_t0
+                    elif pool_mode == "mean":
+                        sum_t, count = cast(tuple[torch.Tensor, int], payload)
+                        req_t = (sum_t / max(count, 1)).unsqueeze(0)
+                    else:  # "last_token"
+                        req_t = cast(torch.Tensor, payload).unsqueeze(0)
+
+                    req_tensors.append(req_t)
+                    lengths.append(int(req_t.shape[0]))
+
+                if req_tensors:
+                    cat_t0 = time.perf_counter()
+                    flat_t = (
+                        torch.cat(req_tensors, dim=0)
+                        if len(req_tensors) > 1
+                        else req_tensors[0]
+                    )
+                    concat_s += time.perf_counter() - cat_t0
+                else:
+                    hidden_size = self.model_config.get_hidden_size()
+                    flat_t = torch.empty(
+                        (0, hidden_size),
+                        dtype=self.dtype,
+                        device=self.device,
+                    )
+
+                offsets_np = np.zeros(len(req_ids) + 1, dtype=np.int32)
+                if lengths:
+                    offsets_np[1:] = np.cumsum(np.asarray(lengths, dtype=np.int32))
+                offsets_src = torch.from_numpy(offsets_np)
+                values = flat_t.cpu() if flat_t.is_cuda else flat_t
+                layers_payload[layer_idx] = {
+                    "values": values,
+                    "offsets": offsets_src.clone(),
+                }
+        else:
+            with torch.cuda.stream(self.comm_stream):
+                self.comm_stream.wait_stream(torch.cuda.current_stream())
+                for layer_idx in layer_ids:
+                    req_tensors: list[torch.Tensor] = []
+                    lengths: list[int] = []
+                    for req_id in req_ids:
+                        payload = self._activation_store[req_id].get(layer_idx)
+                        if payload is None:
+                            lengths.append(0)
+                            continue
+
+                        if pool_mode is None:
+                            cat_t0 = time.perf_counter()
+                            tensor_list = cast(list[torch.Tensor], payload)
+                            req_t = (
+                                torch.cat(tensor_list, dim=0)
+                                if len(tensor_list) > 1
+                                else tensor_list[0]
+                            )
+                            concat_s += time.perf_counter() - cat_t0
+                        elif pool_mode == "mean":
+                            sum_t, count = cast(tuple[torch.Tensor, int], payload)
+                            req_t = (sum_t / max(count, 1)).unsqueeze(0)
+                        else:  # "last_token"
+                            req_t = cast(torch.Tensor, payload).unsqueeze(0)
+
+                        req_tensors.append(req_t)
+                        lengths.append(int(req_t.shape[0]))
+
+                    if req_tensors:
+                        cat_t0 = time.perf_counter()
+                        flat_t = (
+                            torch.cat(req_tensors, dim=0)
+                            if len(req_tensors) > 1
+                            else req_tensors[0]
+                        )
+                        concat_s += time.perf_counter() - cat_t0
+                    else:
+                        hidden_size = self.model_config.get_hidden_size()
+                        flat_t = torch.empty(
+                            (0, hidden_size),
+                            dtype=self.dtype,
+                            device=self.device,
+                        )
+
+                    offsets_np = np.zeros(len(req_ids) + 1, dtype=np.int32)
+                    if lengths:
+                        offsets_np[1:] = np.cumsum(np.asarray(lengths, dtype=np.int32))
+                    offsets_src = torch.from_numpy(offsets_np)
+
+                    if flat_t.is_cuda:
+                        values = torch.empty(
+                            flat_t.shape,
+                            dtype=flat_t.dtype,
+                            device="cpu",
+                            pin_memory=self.pin_memory,
+                        )
+                        values.copy_(flat_t, non_blocking=True)
+                        copied = True
+                        source_refs.append(flat_t)
+                    else:
+                        values = flat_t
+                    offsets = offsets_src.clone()
+
+                    layers_payload[layer_idx] = {
+                        "values": values,
+                        "offsets": offsets,
+                    }
+
+                if copied:
+                    copy_event = torch.cuda.Event()
+                    self.comm_stream.record_event(copy_event)
+
+            if copy_event is not None:
+                copy_event.synchronize()
+
+        self._activation_stats["cpu_copy_s"] += time.perf_counter() - copy_t0
+        self._activation_stats["concat_s"] += concat_s
+        self._activation_store = {}
+        payload = {
+            "__flat__": True,
+            "req_ids": req_ids,
+            "layers": layers_payload,
+        }
+        if sync:
+            source_refs = []
+            copy_event = None
+        return payload, copy_event, source_refs
+
+    def get_captured_activations(
+        self,
+    ) -> dict[str, Any]:
+        """Retrieve per-request captured activations as CPU tensors.
+
+        Returns dict mapping req_id -> {layer_idx -> tensor}.
+        Clears the capture buffer after retrieval.
+        """
+        if self._activation_capture_tp_rank0_only and not is_global_first_rank():
+            self._activation_store = {}
+            self._activation_step_store = []
+            return {}
+
+        if self._activation_capture_flat_output:
+            payload, _, _ = self._build_captured_activations_flat(sync=True)
+            return payload
+
+        result: dict[str, dict[int, torch.Tensor]] = {}
+        pool_mode = self._activation_capture_pool
+        concat_s = 0.0
+        copy_sources: list[torch.Tensor] = []
+        if self._activation_step_store:
+            self._materialize_activation_step_store()
+
+        copy_t0 = time.perf_counter()
+        with torch.cuda.stream(self.comm_stream):
+            self.comm_stream.wait_stream(torch.cuda.current_stream())
+            for req_id, layers in self._activation_store.items():
+                req_result: dict[int, torch.Tensor] = {}
+                for layer_idx, payload in layers.items():
+                    if pool_mode is None:
+                        cat_t0 = time.perf_counter()
+                        tensor_list = cast(list[torch.Tensor], payload)
+                        t = (
+                            torch.cat(tensor_list, dim=0)
+                            if len(tensor_list) > 1
+                            else tensor_list[0]
+                        )
+                        concat_s += time.perf_counter() - cat_t0
+                    elif pool_mode == "mean":
+                        sum_t, count = cast(tuple[torch.Tensor, int], payload)
+                        t = (sum_t / max(count, 1)).unsqueeze(0)
+                    else:  # "last_token"
+                        t = cast(torch.Tensor, payload).unsqueeze(0)
+
+                    if t.is_cuda:
+                        t_cpu = torch.empty(
+                            t.shape,
+                            dtype=t.dtype,
+                            device="cpu",
+                            pin_memory=self.pin_memory,
+                        )
+                        t_cpu.copy_(t, non_blocking=True)
+                        req_result[layer_idx] = t_cpu
+                        copy_sources.append(t)
+                    else:
+                        req_result[layer_idx] = t
+
+                result[req_id] = req_result
+
+        if copy_sources:
+            self.comm_stream.synchronize()
+        self._activation_stats["cpu_copy_s"] += time.perf_counter() - copy_t0
+        self._activation_stats["concat_s"] += concat_s
+
+        self._activation_store = {}
+        return result
+
+    def stage_captured_activations(self) -> bool:
+        """Stage captured activations with async D2H copies for overlap."""
+        if self._activation_capture_tp_rank0_only and not is_global_first_rank():
+            self._activation_store = {}
+            self._activation_step_store = []
+            return False
+        if not self._activation_capture_flat_output:
+            payload = self.get_captured_activations()
+            self._activation_staged_exports.append((payload, None, None))
+            return True
+
+        t0 = time.perf_counter()
+        payload, event, source_refs = self._build_captured_activations_flat(sync=False)
+        self._activation_staged_exports.append((payload, event, source_refs))
+        self._activation_stats["stage_export_s"] += time.perf_counter() - t0
+        return True
+
+    def pop_staged_activations(self) -> dict[str, Any]:
+        """Pop the oldest staged activation payload, waiting for copy completion."""
+        if not self._activation_staged_exports:
+            return {}
+        payload, event, source_refs = self._activation_staged_exports.popleft()
+        t0 = time.perf_counter()
+        if event is not None:
+            event.synchronize()
+        self._activation_stats["stage_wait_s"] += time.perf_counter() - t0
+        # Hold refs through event synchronization so async D2H source tensors
+        # remain valid until transfer completion.
+        del source_refs
+        return payload
+
+    def get_activation_capture_stats(self) -> dict[str, float]:
+        """Retrieve and clear activation capture timing stats."""
+        stats = dict(self._activation_stats)
+        self._activation_stats = defaultdict(float)
+        return stats
+
+    def remove_activation_capture(self) -> None:
+        """Disable activation capture."""
+        model = self.get_model()
+        model.set_activation_capture_layers(())
+        self._activation_capture_active = False
+        self._activation_capture_pool = None
+        self._activation_capture_fast_path = False
+        self._activation_capture_tp_rank0_only = True
+        self._activation_capture_flat_output = True
+        self._activation_store = {}
+        self._activation_step_store = []
+        self._activation_staged_exports = deque()
+        self._activation_export_value_buffers = [{}, {}]
+        self._activation_export_offset_buffers = [{}, {}]
+        self._activation_export_slot = 0
+        self._activation_stats = defaultdict(float)
+
+    # ──────────────────────────────────────────────────────────────────
+
     def get_supported_generation_tasks(self) -> list[GenerationTask]:
         model = self.get_model()
         supported_tasks = list[GenerationTask]()
@@ -3543,6 +4133,10 @@ class GPUModelRunner(
                 **model_kwargs,
             )
 
+        # Split and store captured activations per-request for this step.
+        if self._activation_capture_active:
+            self._process_step_activations(req_ids, tokens)
+
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
                 # True when EAGLE 3 is used.
@@ -3551,6 +4145,12 @@ class GPUModelRunner(
                 # Common case.
                 hidden_states = model_output
                 aux_hidden_states = None
+
+            activation_fast_path = (
+                self._activation_capture_active
+                and self._activation_capture_fast_path
+                and not self.use_async_scheduling
+            )
 
             if not self.broadcast_pp_output:
                 # Common case.
@@ -3570,8 +4170,12 @@ class GPUModelRunner(
                         kv_connector_output,
                     )
 
-                sample_hidden_states = hidden_states[logits_indices]
-                logits = self.model.compute_logits(sample_hidden_states)
+                if activation_fast_path:
+                    sample_hidden_states = hidden_states[:0]
+                    logits = None
+                else:
+                    sample_hidden_states = hidden_states[logits_indices]
+                    logits = self.model.compute_logits(sample_hidden_states)
             else:
                 # Rare case.
                 assert not self.is_pooling_model
@@ -3655,6 +4259,44 @@ class GPUModelRunner(
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
+
+        if (
+            self._activation_capture_active
+            and self._activation_capture_fast_path
+            and logits is None
+            and not self.use_async_scheduling
+        ):
+            num_reqs = self.input_batch.num_reqs
+            sampled_token_ids_cpu: list[list[int]] = [[0] for _ in range(num_reqs)]
+            discard_req_indices = np.nonzero(self.discard_request_mask.np[:num_reqs])[0]
+            for req_idx in discard_req_indices:
+                sampled_token_ids_cpu[int(req_idx)] = []
+
+            sampled_token_ids_gpu = torch.zeros(
+                (num_reqs, 1),
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self._update_states_after_model_execute(sampled_token_ids_gpu, scheduler_output)
+
+            self._draft_token_ids = None
+            self._draft_token_req_ids = None
+            self.input_batch.prev_sampled_token_ids = None
+
+            self.eplb_step()
+            return ModelRunnerOutput(
+                req_ids=self.input_batch.req_ids.copy(),
+                req_id_to_index=self.input_batch.req_id_to_index.copy(),
+                sampled_token_ids=sampled_token_ids_cpu,
+                logprobs=None,
+                prompt_logprobs_dict={},
+                kv_connector_output=kv_connector_output,
+                ec_connector_output=ec_connector_output
+                if self.supports_mm_inputs
+                else None,
+                num_nans_in_logits={},
+                cudagraph_stats=cudagraph_stats,
+            )
 
         # Apply structured output bitmasks if present.
         if grammar_output is not None:

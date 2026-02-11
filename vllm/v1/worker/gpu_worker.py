@@ -299,6 +299,43 @@ class Worker(WorkerBase):
     def reload_weights(self, *args, **kwargs) -> None:
         self.model_runner.reload_weights(*args, **kwargs)
 
+    # ── Activation capture for probing ────────────────────────────────
+
+    def register_activation_capture(
+        self,
+        layers,
+        hook_point="post_block",
+        pool_mode=None,
+        activation_only=False,
+        tp_rank0_only=True,
+        flat_output=True,
+    ):
+        self.model_runner.register_activation_capture(
+            layers,
+            hook_point,
+            pool_mode,
+            activation_only,
+            tp_rank0_only,
+            flat_output,
+        )
+
+    def get_captured_activations(self):
+        return self.model_runner.get_captured_activations()
+
+    def get_activation_capture_stats(self):
+        return self.model_runner.get_activation_capture_stats()
+
+    def stage_captured_activations(self):
+        return self.model_runner.stage_captured_activations()
+
+    def pop_staged_activations(self):
+        return self.model_runner.pop_staged_activations()
+
+    def remove_activation_capture(self):
+        self.model_runner.remove_activation_capture()
+
+    # ──────────────────────────────────────────────────────────────────
+
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
         """Profiles the peak memory usage of the model to determine how much

@@ -76,6 +76,9 @@ class Request:
         reasoning_ended: bool | None = None,
     ) -> None:
         self.request_id = request_id
+        # The original user-provided request ID when the internal ID has
+        # suffixes appended by the input processor.
+        self.external_req_id: str | None = None
         self.client_index = client_index
         self.priority = priority
         self.sampling_params = sampling_params
@@ -182,7 +185,7 @@ class Request:
         request: EngineCoreRequest,
         block_hasher: Callable[["Request"], list["BlockHash"]] | None,
     ) -> "Request":
-        return cls(
+        req = cls(
             request_id=request.request_id,
             client_index=request.client_index,
             prompt_token_ids=request.prompt_token_ids,
@@ -200,6 +203,8 @@ class Request:
             resumable=request.resumable,
             reasoning_ended=request.reasoning_ended,
         )
+        req.external_req_id = request.external_req_id
+        return req
 
     def append_output_token_ids(
         self,
