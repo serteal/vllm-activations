@@ -309,6 +309,7 @@ class Worker(WorkerBase):
         activation_only=False,
         tp_rank0_only=True,
         flat_output=True,
+        export_to_cpu=True,
     ):
         self.model_runner.register_activation_capture(
             layers,
@@ -317,6 +318,7 @@ class Worker(WorkerBase):
             activation_only,
             tp_rank0_only,
             flat_output,
+            export_to_cpu,
         )
 
     def get_captured_activations(self):

@@ -16,6 +16,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
 from collections.abc import Iterable
 from itertools import islice
 
@@ -276,6 +277,17 @@ class Gemma2Model(nn.Module):
         )
         self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+        # Activation capture for probing (post-layer hidden state).
+        _env_layers = os.environ.get("_VLLM_ACTIVATION_CAPTURE_LAYERS", "")
+        self.activation_capture_layers: tuple[int, ...] = (
+            tuple(int(x) for x in _env_layers.split(",")) if _env_layers else ()
+        )
+        self._captured_activations: dict[int, list[torch.Tensor]] = {}
+        self._early_exit_layer: int = (
+            max(self.activation_capture_layers)
+            if self.activation_capture_layers else -1
+        )
+
         # Normalize the embedding by sqrt(hidden_size)
         # The normalizer's data type should be downcasted to the model's
         # data type such as bfloat16, not float32.
@@ -307,12 +319,19 @@ class Gemma2Model(nn.Module):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
-        for layer in islice(self.layers, self.start_layer, self.end_layer):
+        for idx, layer in enumerate(islice(self.layers, self.start_layer, self.end_layer)):
+            global_idx = self.start_layer + idx
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
                 residual,
             )
+            if global_idx in self.activation_capture_layers:
+                self._captured_activations.setdefault(global_idx, []).append(
+                    (hidden_states + residual).detach()
+                )
+                if global_idx == self._early_exit_layer:
+                    break
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "residual": residual}
@@ -407,6 +426,23 @@ class Gemma2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
+
+    def set_activation_capture_layers(self, layers: tuple[int, ...]) -> None:
+        self.model.activation_capture_layers = tuple(layers)
+        self.model._captured_activations = {}
+        self.model._early_exit_layer = max(layers) if layers else -1
+
+    def get_captured_activations(self) -> dict[int, torch.Tensor]:
+        raw = self.pop_captured_activations()
+        result: dict[int, torch.Tensor] = {}
+        for layer_idx, tensors in raw.items():
+            result[layer_idx] = torch.cat(tensors, dim=0)
+        return result
+
+    def pop_captured_activations(self) -> dict[int, list[torch.Tensor]]:
+        result = self.model._captured_activations
+        self.model._captured_activations = {}
+        return result
 
     def forward(
         self,

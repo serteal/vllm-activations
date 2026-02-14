@@ -614,6 +614,15 @@ class Gemma3ForConditionalGeneration(
             handle_oov_mm_token=handle_oov_mm_token,
         )
 
+    def set_activation_capture_layers(self, layers: tuple[int, ...]) -> None:
+        self.language_model.set_activation_capture_layers(layers)
+
+    def get_captured_activations(self) -> dict[int, torch.Tensor]:
+        return self.language_model.get_captured_activations()
+
+    def pop_captured_activations(self) -> dict[int, list[torch.Tensor]]:
+        return self.language_model.pop_captured_activations()
+
     def forward(
         self,
         input_ids: torch.Tensor | None,

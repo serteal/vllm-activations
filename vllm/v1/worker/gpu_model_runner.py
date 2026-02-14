@@ -2571,6 +2571,7 @@ class GPUModelRunner(
     _activation_capture_fast_path: bool = False
     _activation_capture_tp_rank0_only: bool = True
     _activation_capture_flat_output: bool = True
+    _activation_capture_export_to_cpu: bool = True
     _activation_store: dict
     _activation_step_store: list[dict[str, Any]]
     _activation_stats: defaultdict[str, float]
@@ -2589,6 +2590,7 @@ class GPUModelRunner(
         activation_only: bool = False,
         tp_rank0_only: bool = True,
         flat_output: bool = True,
+        export_to_cpu: bool = True,
     ) -> None:
         """Configure model to capture activations at specified layers."""
         if hook_point != "post_block":
@@ -2614,6 +2616,7 @@ class GPUModelRunner(
         self._activation_capture_fast_path = activation_only
         self._activation_capture_tp_rank0_only = tp_rank0_only
         self._activation_capture_flat_output = flat_output
+        self._activation_capture_export_to_cpu = export_to_cpu
         self._activation_store = {}
         self._activation_step_store = []
         self._activation_stats = defaultdict(float)
@@ -2834,14 +2837,17 @@ class GPUModelRunner(
             if sync:
                 # Synchronous export path: materialize stable CPU tensors directly.
                 for layer_idx, flat_t in layers.items():
-                    values = flat_t.cpu() if flat_t.is_cuda else flat_t
+                    if self._activation_capture_export_to_cpu and flat_t.is_cuda:
+                        values = flat_t.cpu()
+                    else:
+                        values = flat_t
                     offsets = offsets_src.clone()
                     layers_payload[layer_idx] = {"values": values, "offsets": offsets}
             else:
                 with torch.cuda.stream(self.comm_stream):
                     self.comm_stream.wait_stream(torch.cuda.current_stream())
                     for layer_idx, flat_t in layers.items():
-                        if flat_t.is_cuda:
+                        if self._activation_capture_export_to_cpu and flat_t.is_cuda:
                             values = torch.empty(
                                 flat_t.shape,
                                 dtype=flat_t.dtype,
@@ -2934,7 +2940,10 @@ class GPUModelRunner(
                 if lengths:
                     offsets_np[1:] = np.cumsum(np.asarray(lengths, dtype=np.int32))
                 offsets_src = torch.from_numpy(offsets_np)
-                values = flat_t.cpu() if flat_t.is_cuda else flat_t
+                if self._activation_capture_export_to_cpu and flat_t.is_cuda:
+                    values = flat_t.cpu()
+                else:
+                    values = flat_t
                 layers_payload[layer_idx] = {
                     "values": values,
                     "offsets": offsets_src.clone(),
@@ -2990,7 +2999,7 @@ class GPUModelRunner(
                         offsets_np[1:] = np.cumsum(np.asarray(lengths, dtype=np.int32))
                     offsets_src = torch.from_numpy(offsets_np)
 
-                    if flat_t.is_cuda:
+                    if self._activation_capture_export_to_cpu and flat_t.is_cuda:
                         values = torch.empty(
                             flat_t.shape,
                             dtype=flat_t.dtype,
@@ -3074,7 +3083,7 @@ class GPUModelRunner(
                     else:  # "last_token"
                         t = cast(torch.Tensor, payload).unsqueeze(0)
 
-                    if t.is_cuda:
+                    if self._activation_capture_export_to_cpu and t.is_cuda:
                         t_cpu = torch.empty(
                             t.shape,
                             dtype=t.dtype,
@@ -3103,6 +3112,13 @@ class GPUModelRunner(
             self._activation_store = {}
             self._activation_step_store = []
             return False
+        # Activation-only fast path plus staged async export has shown
+        # deterministic CUDA illegal-address failures on Gemma workloads.
+        # Use the synchronous capture export path for this mode.
+        if self._activation_capture_fast_path:
+            payload = self.get_captured_activations()
+            self._activation_staged_exports.append((payload, None, None))
+            return True
         if not self._activation_capture_flat_output:
             payload = self.get_captured_activations()
             self._activation_staged_exports.append((payload, None, None))
@@ -3143,6 +3159,7 @@ class GPUModelRunner(
         self._activation_capture_fast_path = False
         self._activation_capture_tp_rank0_only = True
         self._activation_capture_flat_output = True
+        self._activation_capture_export_to_cpu = True
         self._activation_store = {}
         self._activation_step_store = []
         self._activation_staged_exports = deque()

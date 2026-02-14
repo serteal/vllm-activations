@@ -10,7 +10,7 @@ from __future__ import annotations
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Iterator
 
 import torch
 
@@ -151,6 +151,11 @@ class ActivationEngine:
         static_shape_bucketing: Group same-length requests together when batching.
         prefill_cudagraph: Prefer non-eager execution so static-shape buckets can
             use CUDA graph paths.
+        activation_export_device: Activation payload export device ("cpu" or
+            "cuda"). "cuda" avoids GPU->CPU copies in single-process mode.
+        text_only: Disable multimodal prompt items by default (image limit=0).
+            This avoids unnecessary multimodal profiling overhead/OOM when using
+            ActivationEngine for text activation collection.
         **kwargs: Additional arguments passed to ``vllm.LLM``.
     """
 
@@ -159,11 +164,11 @@ class ActivationEngine:
         model: str,
         layers: list[int],
         hook_point: str = "post_block",
-        dtype: str = "auto",
+        dtype: str = "bfloat16",
         tensor_parallel_size: int = 1,
         gpu_memory_utilization: float = 0.9,
-        max_model_len: int | None = None,
-        enforce_eager: bool = True,
+        max_model_len: int | None = 4096,
+        enforce_eager: bool = False,
         max_num_batched_tokens: int = 65536,
         max_num_seqs: int | None = None,
         max_num_partial_prefills: int | None = None,
@@ -178,7 +183,9 @@ class ActivationEngine:
         prefill_only: bool = True,
         staged_export: bool = True,
         static_shape_bucketing: bool = True,
-        prefill_cudagraph: bool = False,
+        prefill_cudagraph: bool = True,
+        activation_export_device: str = "cuda",
+        text_only: bool = True,
         **kwargs: Any,
     ):
         self.layers = sorted(layers)
@@ -191,6 +198,12 @@ class ActivationEngine:
         self.staged_export = staged_export
         self.static_shape_bucketing = static_shape_bucketing
         self.prefill_cudagraph = prefill_cudagraph
+        if activation_export_device not in ("cpu", "cuda"):
+            raise ValueError(
+                "activation_export_device must be one of {'cpu', 'cuda'}"
+            )
+        self.activation_export_device = activation_export_device
+        self.text_only = text_only
         self._active_pool_mode: str | None = None
         self._closed = False
 
@@ -230,10 +243,16 @@ class ActivationEngine:
             llm_kwargs["compilation_config"] = compilation_config
         if max_model_len is not None:
             llm_kwargs["max_model_len"] = max_model_len
+
+        if text_only and "limit_mm_per_prompt" not in kwargs:
+            kwargs["limit_mm_per_prompt"] = {"image": 0}
         llm_kwargs.update(kwargs)
 
         self.llm = LLM(**llm_kwargs)
         self._local_worker = self._resolve_local_worker()
+        if self.activation_export_device != "cpu" and self._local_worker is None:
+            # Cross-process RPC payloads are CPU-oriented; keep compatibility.
+            self.activation_export_device = "cpu"
 
         # Register capture layers.
         self._register_capture(self.pool_mode)
@@ -286,6 +305,7 @@ class ActivationEngine:
             self.activation_only,
             self.tp_rank0_only,
             self.flat_output,
+            self.activation_export_device == "cpu",
         )
         self._active_pool_mode = pool_mode
 
@@ -572,6 +592,326 @@ class ActivationEngine:
             num_tokens=restored_num_tokens,
             timings=result.timings,
         )
+
+    def _iter_flat_batch_payloads(
+        self,
+        inputs: list,
+        *,
+        batch_size: int | None,
+        batch_token_budget: int | None,
+        token_lens: list[int] | None,
+        sampling_params: SamplingParams,
+        include_timings: bool,
+        use_staged_export: bool,
+    ) -> Iterator[tuple[list[str], list[int], Any, dict[str, float]]]:
+        """Yield raw flat payloads batch-by-batch in request order."""
+        use_staged = (
+            use_staged_export
+            and self.staged_export
+            and self.flat_output
+            and self._local_worker is not None
+            and hasattr(self._local_worker, "stage_captured_activations")
+            and hasattr(self._local_worker, "pop_staged_activations")
+        )
+
+        pending_req_ids: list[str] | None = None
+        pending_num_tokens: list[int] | None = None
+        pending_timings: dict[str, float] | None = None
+        batch_ranges = self._build_batch_ranges(
+            total_inputs=len(inputs),
+            batch_size=batch_size,
+            batch_token_budget=batch_token_budget,
+            token_lens=token_lens,
+        )
+
+        for start, end in batch_ranges:
+            batch_inputs = inputs[start:end]
+            req_ids, num_tokens, run_timings = self._run_prefill_batch(
+                batch_inputs,
+                sampling_params,
+                include_timings,
+            )
+
+            if use_staged:
+                t_stage0 = time.perf_counter()
+                self._local_worker.stage_captured_activations()
+                t_stage1 = time.perf_counter()
+                if include_timings:
+                    run_timings["stage_captured_activations_s"] = (
+                        run_timings.get("stage_captured_activations_s", 0.0)
+                        + (t_stage1 - t_stage0)
+                    )
+
+                if pending_req_ids is not None and pending_num_tokens is not None:
+                    assert pending_timings is not None
+                    t_pop0 = time.perf_counter()
+                    payload = self._local_worker.pop_staged_activations()
+                    t_pop1 = time.perf_counter()
+                    if include_timings:
+                        pending_timings["rpc_get_captured_activations_s"] = (
+                            pending_timings.get("rpc_get_captured_activations_s", 0.0)
+                            + (t_pop1 - t_pop0)
+                        )
+                    yield pending_req_ids, pending_num_tokens, payload, pending_timings
+
+                pending_req_ids = req_ids
+                pending_num_tokens = num_tokens
+                pending_timings = run_timings if include_timings else {}
+                continue
+
+            t_fetch0 = time.perf_counter()
+            payload = self._worker_call("get_captured_activations")[0]
+            t_fetch1 = time.perf_counter()
+            if include_timings:
+                run_timings["rpc_get_captured_activations_s"] = (
+                    run_timings.get("rpc_get_captured_activations_s", 0.0)
+                    + (t_fetch1 - t_fetch0)
+                )
+                stats_results = self._worker_call("get_activation_capture_stats")
+                if stats_results:
+                    for k, v in stats_results[0].items():
+                        run_timings[f"worker_{k}"] = (
+                            run_timings.get(f"worker_{k}", 0.0) + float(v)
+                        )
+            yield req_ids, num_tokens, payload, run_timings if include_timings else {}
+
+        if use_staged and pending_req_ids is not None and pending_num_tokens is not None:
+            assert pending_timings is not None
+            t_pop0 = time.perf_counter()
+            payload = self._local_worker.pop_staged_activations()
+            t_pop1 = time.perf_counter()
+            if include_timings:
+                pending_timings["rpc_get_captured_activations_s"] = (
+                    pending_timings.get("rpc_get_captured_activations_s", 0.0)
+                    + (t_pop1 - t_pop0)
+                )
+                stats_results = self._worker_call("get_activation_capture_stats")
+                if stats_results:
+                    for k, v in stats_results[0].items():
+                        pending_timings[f"worker_{k}"] = (
+                            pending_timings.get(f"worker_{k}", 0.0) + float(v)
+                        )
+            yield pending_req_ids, pending_num_tokens, payload, pending_timings
+
+    def _payload_to_flat_batch(
+        self,
+        payload: Any,
+        req_ids: list[str],
+        num_tokens: list[int],
+        timings: dict[str, float],
+    ) -> FlatActivationResult:
+        """Normalize worker payload into one chunked FlatActivationResult batch."""
+        layers_payload: dict[int, dict[str, Any]] = {}
+
+        if not isinstance(payload, dict) or payload.get("__flat__") is not True:
+            acts = self._assemble_activations(payload, req_ids, num_tokens)
+            for layer in self.layers:
+                seqs = acts[layer]
+                if seqs:
+                    values = torch.cat(seqs, dim=0)
+                    lengths = torch.tensor(
+                        [int(t.shape[0]) for t in seqs], dtype=torch.int64
+                    )
+                else:
+                    values = torch.empty((0, 0), dtype=torch.float32)
+                    lengths = torch.zeros(len(req_ids), dtype=torch.int64)
+                offsets = torch.empty(len(req_ids) + 1, dtype=torch.int64)
+                offsets[0] = 0
+                if len(req_ids) > 0:
+                    offsets[1:] = torch.cumsum(lengths, dim=0)
+                layers_payload[layer] = {
+                    "__chunked__": True,
+                    "values": [values],
+                    "lengths": [lengths],
+                    "offsets": offsets,
+                }
+            return FlatActivationResult(
+                layers=layers_payload,
+                num_tokens=list(num_tokens),
+                req_ids=list(req_ids),
+                timings=timings,
+            )
+
+        payload_req_ids = payload.get("req_ids", [])
+        layer_payloads = payload.get("layers", {})
+        if payload_req_ids == req_ids:
+            req_positions = list(range(len(req_ids)))
+        else:
+            req_index = {rid: i for i, rid in enumerate(payload_req_ids)}
+            req_positions = [req_index.get(rid, -1) for rid in req_ids]
+
+        for layer in self.layers:
+            layer_payload = layer_payloads.get(layer)
+            if layer_payload is None:
+                lengths = torch.zeros(len(req_ids), dtype=torch.int64)
+                offsets = torch.empty(len(req_ids) + 1, dtype=torch.int64)
+                offsets[0] = 0
+                if len(req_ids) > 0:
+                    offsets[1:] = torch.cumsum(lengths, dim=0)
+                layers_payload[layer] = {
+                    "__chunked__": True,
+                    "values": [torch.empty((0, 0), dtype=torch.float32)],
+                    "lengths": [lengths],
+                    "offsets": offsets,
+                }
+                continue
+
+            values = layer_payload["values"]
+            offsets = layer_payload["offsets"]
+            offsets_list = offsets.tolist()
+            parts: list[torch.Tensor] = []
+            lens_list: list[int] = []
+
+            if req_positions == list(range(len(req_ids))):
+                raw_lens = (offsets[1:].to(torch.int64) - offsets[:-1].to(torch.int64)).cpu()
+                target_lens = torch.tensor(num_tokens, dtype=torch.int64)
+                if raw_lens.numel() != target_lens.numel():
+                    target_lens = target_lens[: raw_lens.numel()]
+                if bool(torch.any(raw_lens > target_lens)):
+                    for i, want in enumerate(num_tokens):
+                        start = int(offsets_list[i])
+                        end = int(offsets_list[i + 1])
+                        keep_end = min(end, start + int(want))
+                        keep_len = max(keep_end - start, 0)
+                        lens_list.append(keep_len)
+                        if keep_len > 0:
+                            parts.append(values[start:keep_end])
+                    lengths = torch.tensor(lens_list, dtype=torch.int64)
+                else:
+                    lengths = raw_lens
+                    for i in range(len(req_ids)):
+                        start = int(offsets_list[i])
+                        end = int(offsets_list[i + 1])
+                        if end > start:
+                            parts.append(values[start:end])
+            else:
+                for i, pos in enumerate(req_positions):
+                    if pos < 0:
+                        lens_list.append(0)
+                        continue
+                    start = int(offsets_list[pos])
+                    end = int(offsets_list[pos + 1])
+                    keep_end = min(end, start + int(num_tokens[i]))
+                    keep_len = max(keep_end - start, 0)
+                    lens_list.append(keep_len)
+                    if keep_len > 0:
+                        parts.append(values[start:keep_end])
+                lengths = torch.tensor(lens_list, dtype=torch.int64)
+
+            if parts:
+                batch_values = torch.cat(parts, dim=0)
+            else:
+                hidden = int(values.shape[1]) if values.ndim == 2 else 0
+                batch_values = values.new_empty((0, hidden))
+            if lengths.numel() != len(req_ids):
+                if lengths.numel() < len(req_ids):
+                    pad = torch.zeros(len(req_ids) - lengths.numel(), dtype=torch.int64)
+                    lengths = torch.cat([lengths, pad], dim=0)
+                else:
+                    lengths = lengths[: len(req_ids)]
+            offsets_out = torch.empty(len(req_ids) + 1, dtype=torch.int64)
+            offsets_out[0] = 0
+            if len(req_ids) > 0:
+                offsets_out[1:] = torch.cumsum(lengths, dim=0)
+            layers_payload[layer] = {
+                "__chunked__": True,
+                "values": [batch_values],
+                "lengths": [lengths],
+                "offsets": offsets_out,
+            }
+
+        return FlatActivationResult(
+            layers=layers_payload,
+            num_tokens=list(num_tokens),
+            req_ids=list(req_ids),
+            timings=timings,
+        )
+
+    def stream_flat(
+        self,
+        prompts: list[str] | None = None,
+        token_ids: list[list[int]] | None = None,
+        batch_size: int | None = None,
+        batch_token_budget: int | None = None,
+        pool_mode: str | None = None,
+        include_timings: bool = False,
+        sort_by_length: bool = True,
+        preserve_input_order: bool = False,
+        use_staged_export: bool = True,
+    ) -> Iterator[FlatActivationResult]:
+        """Yield flat activation payloads incrementally per processed batch."""
+        if preserve_input_order:
+            # Streaming reorder would require buffering all batches anyway.
+            yield self.collect_flat(
+                prompts=prompts,
+                token_ids=token_ids,
+                batch_size=batch_size,
+                batch_token_budget=batch_token_budget,
+                pool_mode=pool_mode,
+                include_timings=include_timings,
+                sort_by_length=sort_by_length,
+                preserve_input_order=True,
+                use_staged_export=use_staged_export,
+            )
+            return
+
+        if self._closed:
+            raise RuntimeError("ActivationEngine is closed")
+        if prompts is None and token_ids is None:
+            raise ValueError("Provide either prompts or token_ids")
+        if prompts is not None and token_ids is not None:
+            raise ValueError("Provide only one of prompts or token_ids")
+        if batch_size is not None and batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        if batch_token_budget is not None and batch_token_budget <= 0:
+            raise ValueError("batch_token_budget must be positive")
+        if batch_token_budget is not None and token_ids is None:
+            raise ValueError("batch_token_budget requires token_ids input")
+
+        if token_ids is not None:
+            inputs: list = [{"prompt_token_ids": ids} for ids in token_ids]
+        else:
+            inputs = prompts  # type: ignore[assignment]
+
+        effective_pool_mode = self.pool_mode if pool_mode is None else pool_mode
+        if effective_pool_mode not in (None, "mean", "last_token"):
+            raise ValueError(
+                f"Unsupported pool_mode={effective_pool_mode!r}. "
+                "Expected one of: None, 'mean', 'last_token'."
+            )
+        if self._active_pool_mode != effective_pool_mode:
+            self._register_capture(effective_pool_mode)
+
+        ordered_token_lens: list[int] | None = None
+        if token_ids is not None:
+            ordered = self._ordered_indices(
+                token_ids,
+                batch_size,
+                batch_token_budget,
+                sort_by_length,
+            )
+            if ordered is not None:
+                inputs = [inputs[i] for i in ordered]
+                ordered_token_lens = [len(token_ids[i]) for i in ordered]
+            else:
+                ordered_token_lens = [len(ids) for ids in token_ids]
+
+        sampling_params = self._make_sampling_params()
+        for req_ids, num_tokens, payload, timings in self._iter_flat_batch_payloads(
+            inputs,
+            batch_size=batch_size,
+            batch_token_budget=batch_token_budget,
+            token_lens=ordered_token_lens,
+            sampling_params=sampling_params,
+            include_timings=include_timings,
+            use_staged_export=use_staged_export,
+        ):
+            yield self._payload_to_flat_batch(
+                payload,
+                req_ids,
+                num_tokens,
+                timings if include_timings else {},
+            )
 
     def collect_flat(
         self,
