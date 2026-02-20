@@ -166,7 +166,7 @@ class ActivationEngine:
         hook_point: str = "post_block",
         dtype: str = "bfloat16",
         tensor_parallel_size: int = 1,
-        gpu_memory_utilization: float = 0.9,
+        gpu_memory_utilization: float = 0.35,
         max_model_len: int | None = 4096,
         enforce_eager: bool = False,
         max_num_batched_tokens: int = 65536,
